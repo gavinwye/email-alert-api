@@ -1,38 +1,46 @@
 namespace :data_migration do
   desc "Switch immediate subscribers of the specified list slugs to daily digest"
   task switch_to_daily_digest: :environment do |_t, args|
-    lists = SubscriberList.where(slug: args.extras)
-    raise "One or more lists were not found" if lists.count != args.extras.count
+    list_ids = SubscriberList.where(slug: args.extras).pluck(:id)
+    raise "One or more lists were not found" if list_ids.count != args.extras.count
 
-    subscriptions = Subscription.active.immediately.where(subscriber_list: lists)
+    subscriptions = Subscription.active.immediately.where(subscriber_list_id: list_ids)
     raise "No subscriptions to change" if subscriptions.none?
 
-    subscribers = Subscriber.where(id: subscriptions.pluck(:subscriber_id)).index_by(&:id)
-    subscriptions_by_subscriber = subscriptions.group_by(&:subscriber_id).transform_keys { |k| subscribers[k] }
+    subscribers = Subscriber.where(id: subscriptions.pluck(:subscriber_id))
+    index = 1
 
-    puts 'hi'
+    subscribers.find_each(batch_size: 10000) do |subscriber_batch|
+      puts "Processing batch #{index}"
+      index += 1
 
-    subscriptions_by_subscriber.each do |subscriber, immediate_subscriptions|
-      email_id = nil
+      subscriptions_by_subscriber = subscriptions
+        .where(subscriber: subscriber_batch)
+        .includes(:subscriber)
+        .group_by(&:subscriber)
 
-      subscriber.with_lock do
-        immediate_subscriptions.each do |subscription|
-          subscription.end(reason: :bulk_immediate_to_digest)
+      subscriptions_by_subscriber.each do |subscriber, immediate_subscriptions|
+        email_id = nil
 
-          Subscription.create!(
-            subscriber_id: subscription.subscriber_id,
-            subscriber_list_id: subscription.subscriber_list_id,
-            frequency: :daily,
-            source: :bulk_immediate_to_digest,
-          )
+        subscriber.with_lock do
+          immediate_subscriptions.each do |subscription|
+            subscription.end(reason: :bulk_immediate_to_digest)
+
+            Subscription.create!(
+              subscriber_id: subscription.subscriber_id,
+              subscriber_list_id: subscription.subscriber_list_id,
+              frequency: :daily,
+              source: :bulk_immediate_to_digest,
+            )
+          end
+
+          email_id = SwitchToDailyDigestEmailBuilder.call(subscriber, immediate_subscriptions)
         end
 
-        email_id = SwitchToDailyDigestEmailBuilder.call(subscriber, immediate_subscriptions)
+        DeliveryRequestWorker.perform_async_in_queue(email_id, queue: :default)
+      rescue StandardError => e
+        puts "Skipping subscriber: #{e}"
       end
-
-      DeliveryRequestWorker.perform_async_in_queue(email_id, queue: :default)
-    rescue StandardError => e
-      puts "Skipping subscriber: #{e}"
     end
   end
 
